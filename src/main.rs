@@ -3785,6 +3785,9 @@ struct Tab {
     /// Selection anchor (char index) within `find_query`; `Some` and different
     /// from `find_cursor` means a range is selected (Option+Shift+Arrow, Cmd+A).
     find_anchor: Option<usize>,
+    /// Whether ↑/↓ have picked a result since the filter opened. Until then
+    /// the selection is whatever it was before, and Enter opens the top match.
+    find_picked: bool,
     /// Result set of the active `content:` Spotlight search (absolute paths in
     /// this folder), and the term it corresponds to. `None` = no content
     /// search resolved yet.
@@ -3860,6 +3863,7 @@ impl Tab {
             find_results: Vec::new(),
             find_cursor: 0,
             find_anchor: None,
+            find_picked: false,
             content_hits: None,
             content_for: None,
             content_gen: 0,
@@ -11171,6 +11175,7 @@ impl Shuffle {
         tab.find_query = Some(String::new());
         tab.find_cursor = 0;
         tab.find_anchor = None;
+        tab.find_picked = false;
         self.recompute_find(pane);
         cx.notify();
     }
@@ -11391,9 +11396,14 @@ impl Shuffle {
                 cx.notify();
             }
             "enter" => {
-                // Open the top match: navigate into dirs, open files.
+                // Open the result picked with ↑/↓, else the top match:
+                // navigate into dirs, open files.
                 let tab = self.tab(pane);
-                if let Some(&i) = tab.find_results.first() {
+                let picked = tab.find_results.iter().copied().find(|&i| {
+                    tab.find_picked
+                        && tab.anchor.as_deref() == Some(tab.current_dir.join(&tab.entries[i].name).as_path())
+                });
+                if let Some(i) = picked.or_else(|| tab.find_results.first().copied()) {
                     let entry = &tab.entries[i];
                     let target = tab.current_dir.join(&entry.name);
                     let is_dir = entry.is_dir;
@@ -11403,6 +11413,28 @@ impl Shuffle {
                     self.open_path(pane, target, is_dir, cx);
                 } else {
                     cx.notify();
+                }
+            }
+            // Up/Down move through the results (⇧ extends) while the cursor
+            // stays in the query. Column view isn't filtered, so not there.
+            "up" | "down" if !cmd && !alt && self.tab(pane).view != ViewMode::Columns => {
+                // Steps from the selection if it's among the results (even
+                // one from before the filter), else starts at the top match.
+                let dy = if ks.key == "up" { -1 } else { 1 };
+                if self.tab(pane).find_results.is_empty() {
+                    return;
+                }
+                self.tab_mut(pane).find_picked = true;
+                if shift {
+                    let step = if self.tab(pane).view == ViewMode::Icons {
+                        dy * self.icon_cols(pane) as i32
+                    } else {
+                        dy
+                    };
+                    self.extend_selection(pane, step, cx);
+                } else {
+                    self.kb_pivot = None;
+                    self.arrow_move(pane, 0, dy, cx);
                 }
             }
             // Cmd+Left/Right jump to start/end (Shift extends); otherwise Left/
